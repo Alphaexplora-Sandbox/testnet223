@@ -1,0 +1,93 @@
+name: ALPHACI Access Gate
+'on':
+  push:
+    branches:
+      - dev
+      - uat
+      - main
+  pull_request:
+    branches:
+      - dev
+      - uat
+      - main
+  workflow_dispatch: {}
+permissions:
+  contents: read
+env:
+  ALPHACI_VALIDATE_URL: https://alphaci-enterprise-be.onrender.com/api/v1/ci/validate
+  ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+jobs:
+  validate-access:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate ALPHACI access
+        run: |-
+          RESPONSE=$(curl -sf -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.ALPHACI_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\":\"${{ github.repository }}\",\"stage\":\"access\",\"workflowRunId\":\"${{ github.run_id }}\",\"headSha\":\"${{ github.event.workflow_run.head_sha || github.sha }}\"}" \
+            "$ALPHACI_VALIDATE_URL") || true
+          HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+          BODY=$(printf '%s' "$RESPONSE" | head -n -1)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::ALPHACI authorization failed (HTTP $HTTP_CODE). ${BODY}"
+            exit 1
+          fi
+          echo "ALPHACI authorization validated."
+  report-results:
+    if: ${{ always() }}
+    needs:
+      - validate-access
+    runs-on: ubuntu-latest
+    env:
+      ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
+      ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+    steps:
+      - name: Report stage results to ALPHACI
+        env:
+          ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
+          ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGE_FAILED: ${{ contains(needs.*.result, 'failure') }}
+          STAGE_CANCELLED: ${{ contains(needs.*.result, 'cancelled') }}
+        run: |-
+          # Derive stage conclusion from upstream needs results
+          if [ "$STAGE_FAILED" = "true" ]; then
+            CONCLUSION="failure"
+          elif [ "$STAGE_CANCELLED" = "true" ]; then
+            CONCLUSION="cancelled"
+          else
+            CONCLUSION="success"
+          fi
+
+          # Report the failed GitHub job name so ALPHACI can give a specific fix
+          FAILED_JOBS=""
+          if [ "$CONCLUSION" = "failure" ]; then
+            FAILED_JOBS=$(curl -sf --max-time 5 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/jobs?filter=latest" | jq -r '.jobs[] | select(.conclusion == "failure") | "Failed GitHub Actions job: \(.name)"' | head -n 5 || true)
+          fi
+
+          # Build results sub-object (quality stage only — reads from job outputs)
+          RESULTS="{}"
+
+          # Build and POST the payload with jq — no string interpolation of context values
+          PAYLOAD=$(jq -n \
+            --arg repo     "$GH_REPO" \
+            --arg branch   "$GH_BRANCH" \
+            --arg sha      "$GH_SHA" \
+            --argjson runId "$GH_RUN_ID" \
+            --arg stage    "access" \
+            --arg conclusion "$CONCLUSION" \
+            --arg rawLogs "$FAILED_JOBS" \
+            --argjson results "$RESULTS" \
+            '{repoFullName:$repo,branch:$branch,commitSha:$sha,runId:$runId,stage:$stage,conclusion:$conclusion,results:$results,rawLogs:$rawLogs}')
+          curl -sf --max-time 5 \
+            -X POST "$ALPHACI_REPORT_URL" \
+            -H "Authorization: Bearer $ALPHACI_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            || echo "::warning::Failed to report pipeline results to ALPHACI"
